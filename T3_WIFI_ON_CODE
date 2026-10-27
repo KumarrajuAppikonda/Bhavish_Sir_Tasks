@@ -1,0 +1,64 @@
+
+#include <Arduino.h>
+#include <WiFi.h>
+
+// Wi-Fi credentials
+const char* WIFI_SSID = "Ripple_Airtel";
+const char* WIFI_PASSWORD = "Ripple123$A";
+
+void setup()
+{
+    // Start Serial Monitor
+    Serial.begin(115200);
+
+    delay(1000);
+
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("       ESP32 Wi-Fi TEST");
+    Serial.println("================================");
+
+    // Start Wi-Fi connection
+    Serial.print("Connecting to Wi-Fi");
+
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    // Wait until connected
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        delay(500);
+        Serial.print(".");
+    }
+
+    // Wi-Fi connected
+    Serial.println();
+    Serial.println("Wi-Fi Connected!");
+
+    // Print Wi-Fi information
+    Serial.print("SSID: ");
+    Serial.println(WiFi.SSID());
+
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    Serial.print("Signal Strength: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+
+    Serial.println("================================");
+}
+
+void loop()
+{
+    // Check Wi-Fi connection continuously
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        Serial.println("Wi-Fi Status: CONNECTED");
+    }
+    else
+    {
+        Serial.println("Wi-Fi Status: DISCONNECTED");
+    }
+
+    delay(5000);
+}
