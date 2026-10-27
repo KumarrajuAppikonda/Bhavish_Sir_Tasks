@@ -1,0 +1,771 @@
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <FastLED.h>
+
+// =====================================================
+// WS2812 SETTINGS
+// =====================================================
+
+#define LED_PIN     5
+#define NUM_LEDS    8
+#define LED_TYPE    WS2812B
+#define COLOR_ORDER GRB
+
+CRGB leds[NUM_LEDS];
+
+#define LED_BRIGHTNESS 80
+
+// =====================================================
+// ESP32 ACCESS POINT SETTINGS
+// =====================================================
+
+const char* AP_SSID = "ESP32_CONFIG";
+const char* AP_PASSWORD = "12345678";
+
+// =====================================================
+// OBJECTS
+// =====================================================
+
+WebServer server(80);
+Preferences preferences;
+
+// =====================================================
+// SAVED WIFI DETAILS
+// =====================================================
+
+String savedSSID = "";
+String savedPassword = "";
+
+// =====================================================
+// LED STATUS
+// =====================================================
+
+enum LED_STATUS
+{
+    LED_AP_MODE,
+    LED_PHONE_CONNECTED,
+    LED_WIFI_CONNECTED,
+    LED_WIFI_FAILED
+};
+
+LED_STATUS ledStatus = LED_AP_MODE;
+
+unsigned long lastLEDBlink = 0;
+bool ledState = false;
+
+const unsigned long LED_BLINK_TIME = 500;
+
+// =====================================================
+// SET ALL WS2812 LEDs
+// =====================================================
+
+void setLEDColor(CRGB color)
+{
+    for (int i = 0; i < NUM_LEDS; i++)
+    {
+        leds[i] = color;
+    }
+
+    FastLED.show();
+}
+
+// =====================================================
+// WS2812 STATUS BLINK
+// =====================================================
+
+void updateLED()
+{
+    unsigned long currentMillis = millis();
+
+    if (currentMillis - lastLEDBlink >= LED_BLINK_TIME)
+    {
+        lastLEDBlink = currentMillis;
+
+        ledState = !ledState;
+
+        if (ledState == true)
+        {
+            // ==========================================
+            // LED ON
+            // ==========================================
+
+            switch (ledStatus)
+            {
+                case LED_AP_MODE:
+
+                    // Violet
+                    setLEDColor(CRGB(148, 0, 211));
+
+                    break;
+
+
+                case LED_PHONE_CONNECTED:
+
+                    // Blue
+                    setLEDColor(CRGB(0, 0, 255));
+
+                    break;
+
+
+                case LED_WIFI_CONNECTED:
+
+                    // Green
+                    setLEDColor(CRGB(0, 255, 0));
+
+                    break;
+
+
+                case LED_WIFI_FAILED:
+
+                    // Red
+                    setLEDColor(CRGB(255, 0, 0));
+
+                    break;
+            }
+        }
+        else
+        {
+            // ==========================================
+            // LED OFF
+            // ==========================================
+
+            setLEDColor(CRGB::Black);
+        }
+    }
+}
+
+// =====================================================
+// LOAD SAVED WIFI
+// =====================================================
+
+void loadWiFiCredentials()
+{
+    preferences.begin("wifi", true);
+
+    savedSSID = preferences.getString("ssid", "");
+    savedPassword = preferences.getString("password", "");
+
+    preferences.end();
+
+    Serial.println();
+    Serial.println("Saved Wi-Fi Details:");
+
+    if (savedSSID.length() > 0)
+    {
+        Serial.print("SSID: ");
+        Serial.println(savedSSID);
+    }
+    else
+    {
+        Serial.println("No Wi-Fi credentials saved.");
+    }
+}
+
+// =====================================================
+// SAVE WIFI
+// =====================================================
+
+void saveWiFiCredentials(String ssid, String password)
+{
+    preferences.begin("wifi", false);
+
+    preferences.putString("ssid", ssid);
+    preferences.putString("password", password);
+
+    preferences.end();
+
+    Serial.println();
+    Serial.println("Wi-Fi credentials saved.");
+}
+
+// =====================================================
+// CONNECT TO WIFI
+// =====================================================
+
+bool connectToWiFi(String ssid, String password)
+{
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("Connecting to Wi-Fi");
+    Serial.println("================================");
+
+    Serial.print("SSID: ");
+    Serial.println(ssid);
+
+    // Start connection
+    WiFi.begin(ssid.c_str(), password.c_str());
+
+    unsigned long startTime = millis();
+
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - startTime < 15000)
+    {
+        // Keep LED blinking during connection
+        updateLED();
+
+        server.handleClient();
+
+        delay(10);
+    }
+
+    Serial.println();
+
+    // =================================================
+    // CONNECTION SUCCESS
+    // =================================================
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        Serial.println("Wi-Fi Connected!");
+
+        Serial.print("Connected Network: ");
+        Serial.println(WiFi.SSID());
+
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+
+        Serial.print("Signal Strength: ");
+        Serial.print(WiFi.RSSI());
+        Serial.println(" dBm");
+
+        // Green blinking
+        ledStatus = LED_WIFI_CONNECTED;
+
+        return true;
+    }
+
+    // =================================================
+    // CONNECTION FAILED
+    // =================================================
+
+    Serial.println("Wi-Fi Connection Failed!");
+
+    Serial.print("Failed SSID: ");
+    Serial.println(ssid);
+
+    // Red blinking
+    ledStatus = LED_WIFI_FAILED;
+
+    return false;
+}
+
+// =====================================================
+// HTML MAIN PAGE
+// =====================================================
+
+String getHTML()
+{
+    String html = "";
+
+    html += "<!DOCTYPE html>";
+
+    html += "<html>";
+
+    html += "<head>";
+
+    html += "<meta name='viewport' ";
+    html += "content='width=device-width, initial-scale=1.0'>";
+
+    html += "<title>ESP32 Wi-Fi Configuration</title>";
+
+    // =================================================
+    // CSS
+    // =================================================
+
+    html += "<style>";
+
+    html += "body{";
+    html += "font-family:Arial;";
+    html += "background:#f2f2f2;";
+    html += "text-align:center;";
+    html += "padding:20px;";
+    html += "}";
+
+    html += ".box{";
+    html += "max-width:400px;";
+    html += "margin:auto;";
+    html += "background:white;";
+    html += "padding:25px;";
+    html += "border-radius:15px;";
+    html += "box-shadow:0 0 10px #aaa;";
+    html += "}";
+
+    html += "input{";
+    html += "width:90%;";
+    html += "padding:12px;";
+    html += "margin:8px;";
+    html += "font-size:16px;";
+    html += "}";
+
+    html += "button{";
+    html += "padding:12px 25px;";
+    html += "background:#007bff;";
+    html += "color:white;";
+    html += "border:none;";
+    html += "border-radius:8px;";
+    html += "font-size:16px;";
+    html += "}";
+
+    html += ".status{";
+    html += "margin-top:20px;";
+    html += "padding:15px;";
+    html += "background:#eeeeee;";
+    html += "border-radius:10px;";
+    html += "}";
+
+    html += "</style>";
+
+    html += "</head>";
+
+    html += "<body>";
+
+    html += "<div class='box'>";
+
+    html += "<h2>ESP32 Wi-Fi Configuration</h2>";
+
+    // =================================================
+    // WIFI STATUS
+    // =================================================
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        html += "<div class='status'>";
+
+        html += "<h3>Wi-Fi Connected</h3>";
+
+        html += "<p><b>Network:</b><br>";
+
+        html += WiFi.SSID();
+
+        html += "</p>";
+
+        html += "<p><b>IP Address:</b><br>";
+
+        html += WiFi.localIP().toString();
+
+        html += "</p>";
+
+        html += "<p><b>Signal Strength:</b><br>";
+
+        html += String(WiFi.RSSI());
+
+        html += " dBm</p>";
+
+        html += "</div>";
+    }
+    else
+    {
+        html += "<div class='status'>";
+
+        if (ledStatus == LED_WIFI_FAILED)
+        {
+            html += "<h3>Wi-Fi Connection Failed</h3>";
+
+            html += "<p>Please check SSID and password.</p>";
+        }
+        else
+        {
+            html += "<h3>Wi-Fi Not Connected</h3>";
+        }
+
+        html += "</div>";
+    }
+
+    // =================================================
+    // WIFI CONFIGURATION FORM
+    // =================================================
+
+    html += "<h3>Configure Wi-Fi</h3>";
+
+    html += "<form action='/save' method='POST'>";
+
+    html += "<input type='text' ";
+    html += "name='ssid' ";
+    html += "placeholder='Enter Wi-Fi Name' ";
+    html += "required>";
+
+    html += "<br>";
+
+    html += "<input type='password' ";
+    html += "name='password' ";
+    html += "placeholder='Enter Wi-Fi Password' ";
+    html += "required>";
+
+    html += "<br><br>";
+
+    html += "<button type='submit'>CONNECT</button>";
+
+    html += "</form>";
+
+    html += "</div>";
+
+    html += "</body>";
+
+    html += "</html>";
+
+    return html;
+}
+
+// =====================================================
+// HOME PAGE
+// =====================================================
+
+void handleRoot()
+{
+    server.send(200, "text/html", getHTML());
+}
+
+// =====================================================
+// SAVE WIFI BUTTON
+// =====================================================
+
+void handleSave()
+{
+    String newSSID = server.arg("ssid");
+
+    String newPassword = server.arg("password");
+
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("New Wi-Fi Configuration Received");
+    Serial.println("================================");
+
+    Serial.print("SSID: ");
+    Serial.println(newSSID);
+
+    // =================================================
+    // SAVE CREDENTIALS
+    // =================================================
+
+    saveWiFiCredentials(newSSID, newPassword);
+
+    // =================================================
+    // DISCONNECT OLD WIFI
+    // =================================================
+
+    WiFi.disconnect();
+
+    delay(500);
+
+    // =================================================
+    // CONNECT TO NEW WIFI
+    // =================================================
+
+    bool connected = connectToWiFi(
+        newSSID,
+        newPassword
+    );
+
+    // =================================================
+    // HTML RESULT PAGE
+    // =================================================
+
+    String html = "";
+
+    html += "<!DOCTYPE html>";
+
+    html += "<html>";
+
+    html += "<head>";
+
+    html += "<meta name='viewport' ";
+    html += "content='width=device-width, initial-scale=1.0'>";
+
+    html += "<title>Wi-Fi Status</title>";
+
+    html += "<style>";
+
+    html += "body{";
+    html += "font-family:Arial;";
+    html += "text-align:center;";
+    html += "padding:30px;";
+    html += "}";
+
+    html += ".box{";
+    html += "max-width:400px;";
+    html += "margin:auto;";
+    html += "padding:25px;";
+    html += "border-radius:15px;";
+    html += "background:#f2f2f2;";
+    html += "}";
+
+    html += "</style>";
+
+    html += "</head>";
+
+    html += "<body>";
+
+    html += "<div class='box'>";
+
+    // =================================================
+    // SUCCESS
+    // =================================================
+
+    if (connected)
+    {
+        html += "<h2>Wi-Fi Connected!</h2>";
+
+        html += "<p><b>Connected Network:</b></p>";
+
+        html += "<p>";
+        html += WiFi.SSID();
+        html += "</p>";
+
+        html += "<p><b>ESP32 IP Address:</b></p>";
+
+        html += "<p>";
+        html += WiFi.localIP().toString();
+        html += "</p>";
+
+        html += "<p><b>Signal Strength:</b></p>";
+
+        html += "<p>";
+        html += String(WiFi.RSSI());
+        html += " dBm";
+        html += "</p>";
+
+        html += "<br>";
+
+        html += "<a href='/'>Back to Configuration</a>";
+    }
+
+    // =================================================
+    // FAILED
+    // =================================================
+
+    else
+    {
+        html += "<h2>Wi-Fi Connection Failed</h2>";
+
+        html += "<p>";
+
+        html += "Could not connect to:<br><br>";
+
+        html += "<b>";
+        html += newSSID;
+        html += "</b>";
+
+        html += "</p>";
+
+        html += "<p>";
+        html += "Please check the Wi-Fi name and password.";
+        html += "</p>";
+
+        html += "<br>";
+
+        html += "<a href='/'>Try Again</a>";
+    }
+
+    html += "</div>";
+
+    html += "</body>";
+
+    html += "</html>";
+
+    server.send(200, "text/html", html);
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+    // =================================================
+    // SERIAL
+    // =================================================
+
+    Serial.begin(115200);
+
+    delay(1000);
+
+    Serial.println();
+
+    Serial.println("================================");
+
+    Serial.println("      ESP32 WIFI CONFIG");
+
+    Serial.println("================================");
+
+    // =================================================
+    // WS2812 INITIALIZATION
+    // =================================================
+
+    FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(
+        leds,
+        NUM_LEDS
+    );
+
+    FastLED.setBrightness(LED_BRIGHTNESS);
+
+    setLEDColor(CRGB::Black);
+
+    // =================================================
+    // LOAD SAVED WIFI
+    // =================================================
+
+    loadWiFiCredentials();
+
+    // =================================================
+    // START AP + STATION MODE
+    // =================================================
+
+    WiFi.mode(WIFI_AP_STA);
+
+    // Start ESP32 Access Point
+
+    WiFi.softAP(
+        AP_SSID,
+        AP_PASSWORD
+    );
+
+    // =================================================
+    // AP INFORMATION
+    // =================================================
+
+    Serial.println();
+
+    Serial.println("ESP32 Access Point Started");
+
+    Serial.print("AP SSID: ");
+
+    Serial.println(AP_SSID);
+
+    Serial.print("AP Password: ");
+
+    Serial.println(AP_PASSWORD);
+
+    Serial.print("AP IP Address: ");
+
+    Serial.println(WiFi.softAPIP());
+
+    // =================================================
+    // DEFAULT LED STATUS
+    // =================================================
+
+    // Violet = AP mode
+    ledStatus = LED_AP_MODE;
+
+    // =================================================
+    // TRY SAVED WIFI
+    // =================================================
+
+    if (savedSSID.length() > 0)
+    {
+        Serial.println();
+
+        Serial.println("Saved Wi-Fi found.");
+
+        connectToWiFi(
+            savedSSID,
+            savedPassword
+        );
+    }
+
+    // =================================================
+    // WEB SERVER
+    // =================================================
+
+    server.on(
+        "/",
+        HTTP_GET,
+        handleRoot
+    );
+
+    server.on(
+        "/save",
+        HTTP_POST,
+        handleSave
+    );
+
+    server.begin();
+
+    Serial.println();
+
+    Serial.println("Web Server Started");
+
+    Serial.println();
+
+    Serial.println("Connect your phone to:");
+
+    Serial.println(AP_SSID);
+
+    Serial.println();
+
+    Serial.println("Password:");
+
+    Serial.println(AP_PASSWORD);
+
+    Serial.println();
+
+    Serial.println("Open browser:");
+
+    Serial.println("http://192.168.4.1");
+
+    Serial.println();
+
+    Serial.println("================================");
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+    // =================================================
+    // HANDLE WEB REQUESTS
+    // =================================================
+
+    server.handleClient();
+
+    // =================================================
+    // CHECK AP PHONE CONNECTION
+    // =================================================
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        int connectedDevices = WiFi.softAPgetStationNum();
+
+        if (connectedDevices > 0)
+        {
+            // ==========================================
+            // PHONE CONNECTED TO ESP32 AP
+            // ==========================================
+
+            if (ledStatus != LED_WIFI_FAILED)
+            {
+                ledStatus = LED_PHONE_CONNECTED;
+            }
+        }
+        else
+        {
+            // ==========================================
+            // AP RUNNING BUT NO PHONE
+            // ==========================================
+
+            if (ledStatus != LED_WIFI_FAILED)
+            {
+                ledStatus = LED_AP_MODE;
+            }
+        }
+    }
+
+    // =================================================
+    // WIFI CONNECTED
+    // =================================================
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        ledStatus = LED_WIFI_CONNECTED;
+    }
+
+    // =================================================
+    // UPDATE WS2812 BLINK
+    // =================================================
+
+    updateLED();
+}
