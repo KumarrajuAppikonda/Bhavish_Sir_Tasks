@@ -1,0 +1,1204 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <FastLED.h>
+#include <DNSServer.h>
+#include <time.h>
+#include <sys/time.h>
+
+/*
+ =====================================================================
+  ESP32 Wi-Fi Manager  (crash-diagnostic revision)
+
+  LED:  VIOLET = AP mode ready (no client) / checking saved Wi-Fi
+        BLUE   = phone connected to ESP32 AP
+        GREEN  = Wi-Fi connected to router
+        RED    = Wi-Fi credentials entered on web page FAILED
+
+  Flow:
+   1. Boot: start AP immediately and check saved Wi-Fi at the same time.
+   2. AP window is 1 minute from boot; a 10-second button hold opens it
+      again for 1 minute.
+   3. Serial Monitor updates one live line with the previous-network name,
+      30-second search countdown, and 4m30s retry-wait countdown.
+   4. If saved Wi-Fi is unavailable, retry every 5 minutes; each attempt
+      lasts up to 30 seconds. The AP window closes after 60 seconds; hold
+      the button for 10 seconds to open it again.
+   4. Captive portal: phone connects to AP -> page opens automatically.
+   5. Time sync WITHOUT NTP: HTTP "Date" header (port 80) from
+      google.com / cloudflare.com / microsoft.com.
+ =====================================================================
+*/
+
+// =====================================================
+// 1. PIN / LED SETTINGS
+// =====================================================
+
+#define LED_PIN          5
+#define NUM_LEDS         8
+#define LED_TYPE         WS2812B
+#define COLOR_ORDER      GRB
+#define LED_BRIGHTNESS   80
+
+#define BUTTON_PIN       4        // BOOT button or external button to GND
+
+CRGB leds[NUM_LEDS];
+
+// =====================================================
+// 2. ACCESS POINT SETTINGS
+// =====================================================
+
+const char* AP_SSID     = "ESP32_AP_MODE";
+const char* AP_PASSWORD = "12345678";
+
+IPAddress apIP(192, 168, 4, 1);
+IPAddress gateway(192, 168, 4, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+// =====================================================
+// 3. TIMING SETTINGS
+// =====================================================
+
+const unsigned long SAVED_WIFI_CHECK_MS   = 30000UL;    // 30 s check of saved Wi-Fi
+const unsigned long USER_WIFI_TIMEOUT_MS  = 20000UL;    // web page credentials
+const unsigned long RETRY_WAIT_MS         = 120000UL;   // 4 min 30 s wait after each 30 s saved-network check
+const unsigned long BUTTON_HOLD_MS        = 10000UL;    // 10 s hold -> AP mode
+const unsigned long AP_WINDOW_MS           = 60000UL;    // AP window: 1 minute at boot or after button hold
+const unsigned long SERIAL_TIME_INTERVAL_MS = 1000UL;   // print date/time every second
+const unsigned long WIFI_LOST_MS          = 15000UL;    // Wi-Fi drop time before AP mode opens
+const unsigned long TIME_RESYNC_MS        = 6UL * 3600UL * 1000UL;
+const unsigned long TIME_RETRY_MS         = 60000UL;
+
+// Local time zone (POSIX format). India = IST-5:30
+const char* TZ_INFO = "IST-5:30";
+
+// =====================================================
+// 4. OBJECTS
+// =====================================================
+
+WebServer   server(80);
+DNSServer   dnsServer;
+Preferences preferences;
+
+// =====================================================
+// 5. STATE VARIABLES
+// =====================================================
+
+String savedSSID      = "";
+String savedPassword  = "";
+String pendingSSID    = "";
+String pendingPassword = "";
+
+bool wifiAttemptInProgress = false;
+bool userAttempt           = false;
+bool userAttemptFailed     = false;
+bool restoringPreviousNetwork = false;
+unsigned long wifiAttemptStart = 0;
+
+bool apActive = false;
+bool apForced = false;
+unsigned long closeApAt    = 0;     // scheduled AP shutdown after success
+unsigned long apIdleSince  = 0;
+unsigned long lastSerialTimePrint = 0;
+unsigned long apWindowStarted = 0;
+unsigned long apWindowExpires = 0;
+size_t previousStatusLineLength = 0;
+
+enum RetryPhase { RP_IDLE, RP_WAITING, RP_CHECKING };
+RetryPhase retryPhase = RP_IDLE;
+unsigned long retryPhaseStart = 0;
+
+// Legacy state retained for compatibility. When no credentials are saved,
+// display NOT FOUND and wait for the user to configure Wi-Fi via the AP.
+bool emptySavedSearchActive = false;
+unsigned long emptySavedSearchStart = 0;
+
+bool wasConnected = false;
+unsigned long lostSince = 0;
+
+// Button
+bool btnDown = false;
+bool btnHandled = false;
+unsigned long btnStart = 0;
+
+// Time sync
+bool timeSynced = false;
+unsigned long lastSyncOk = 0;
+unsigned long lastSyncTry = 0;
+bool needSync = false;
+
+// =====================================================
+// 6. LED STATUS
+// =====================================================
+
+enum LED_STATUS
+{
+    LED_NONE,
+    LED_AP_MODE,
+    LED_PHONE_CONNECTED,
+    LED_WIFI_CONNECTED,
+    LED_WIFI_FAILED
+};
+
+LED_STATUS ledStatus = LED_NONE;
+
+void showLEDColor(CRGB color)
+{
+    for (int i = 0; i < NUM_LEDS; i++) leds[i] = color;
+    FastLED.show();
+}
+
+void setLEDStatus(LED_STATUS s)
+{
+    if (ledStatus == s) return;
+    ledStatus = s;
+
+    switch (s)
+    {
+        case LED_AP_MODE:
+            showLEDColor(CRGB(148, 0, 211));
+            break;
+        case LED_PHONE_CONNECTED:
+            showLEDColor(CRGB(0, 0, 255));
+            break;
+        case LED_WIFI_CONNECTED:
+            showLEDColor(CRGB(0, 255, 0));
+            break;
+        case LED_WIFI_FAILED:
+            showLEDColor(CRGB(255, 0, 0));
+            break;
+        default:
+            break;
+    }
+}
+
+void updateLEDStatus()
+{
+    int clients = apActive ? WiFi.softAPgetStationNum() : 0;
+
+    // Clear an old failure indication after the phone disconnects.
+    if (clients == 0 && !restoringPreviousNetwork)
+    {
+        userAttemptFailed = false;
+    }
+
+    // Wrong candidate credentials: show RED while the phone is still connected.
+    if (userAttemptFailed && clients > 0)
+    {
+        setLEDStatus(LED_WIFI_FAILED);
+        return;
+    }
+
+    // Router connection takes priority once the previous/new network is online.
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        setLEDStatus(LED_WIFI_CONNECTED);
+        return;
+    }
+
+    // Phone connected to configuration AP while router is offline.
+    if (clients > 0)
+    {
+        setLEDStatus(LED_PHONE_CONNECTED);
+        return;
+    }
+
+    // AP is available and waiting.
+    setLEDStatus(LED_AP_MODE);
+}
+
+// =====================================================
+// 7. SAVED CREDENTIALS
+// =====================================================
+
+void loadWiFiCredentials()
+{
+    // Preferences uses ESP32 NVS flash storage. Data survives normal power-off.
+    if (!preferences.begin("wifi", true))
+    {
+        savedSSID = "";
+        savedPassword = "";
+        Serial.println("ERROR: Could not open Wi-Fi Preferences for reading.");
+        return;
+    }
+
+    savedSSID     = preferences.getString("ssid", "");
+    savedPassword = preferences.getString("password", "");
+    preferences.end();
+
+    // Clean up any placeholder value left by an older firmware version.
+    if (savedSSID.equalsIgnoreCase("NOTHING") ||
+        savedSSID.equalsIgnoreCase("NOT FOUND"))
+    {
+        savedSSID = "";
+        savedPassword = "";
+    }
+
+    if (savedSSID.length() > 0)
+    {
+        Serial.print("STATUS: Saved Wi-Fi credentials loaded from flash. SSID = ");
+        Serial.println(savedSSID);
+        Serial.println("STATUS: ESP32 will automatically reconnect to this network.");
+    }
+    else
+    {
+        Serial.println("STATUS: No saved Wi-Fi credentials in flash.");
+        Serial.println("ACTION: Configure Wi-Fi on http://192.168.4.1; credentials are saved after connection succeeds.");
+    }
+}
+
+bool saveWiFiCredentials(const String& ssid, const String& password)
+{
+    if (ssid.length() == 0)
+    {
+        Serial.println("ERROR: Empty SSID; credentials were not saved.");
+        return false;
+    }
+
+    // Write the credentials to non-volatile NVS flash, not temporary RAM.
+    if (!preferences.begin("wifi", false))
+    {
+        Serial.println("ERROR: Could not open Wi-Fi Preferences for writing.");
+        return false;
+    }
+
+    size_t ssidBytes = preferences.putString("ssid", ssid);
+    size_t passwordBytes = preferences.putString("password", password);
+
+    // Read back before closing to verify that the flash write succeeded.
+    String verifySSID = preferences.getString("ssid", "");
+    String verifyPassword = preferences.getString("password", "");
+    preferences.end();
+
+    if (ssidBytes == 0 || verifySSID != ssid || verifyPassword != password)
+    {
+        Serial.println("ERROR: Wi-Fi credentials could not be verified in flash.");
+        return false;
+    }
+
+    savedSSID = verifySSID;
+    savedPassword = verifyPassword;
+    emptySavedSearchActive = false;
+    retryPhase = RP_IDLE;
+
+    Serial.println("STATUS: Wi-Fi credentials SAVED and VERIFIED in ESP32 flash (Preferences/NVS).");
+    Serial.print("STATUS: Saved SSID = ");
+    Serial.println(savedSSID);
+    Serial.println("INFO: Credentials will remain after normal power-off/restart.");
+    return true;
+}
+
+// =====================================================
+// 8. ACCESS POINT START / STOP
+// =====================================================
+
+void startAP(bool restartWindow = true)
+{
+    if (!apActive)
+    {
+        Serial.println("INIT: Enabling AP + station mode...");
+        WiFi.mode(WIFI_AP_STA);
+        delay(100);
+
+        if (!WiFi.softAPConfig(apIP, gateway, subnet))
+        {
+            Serial.println("ERROR: softAPConfig failed.");
+        }
+
+        delay(100);
+        if (!WiFi.softAP(AP_SSID, AP_PASSWORD, 1, 0, 4))
+        {
+            Serial.println("ERROR: SoftAP start failed.");
+            return;
+        }
+
+        dnsServer.start(53, "*", apIP);
+        apActive = true;
+        Serial.println("STATUS: Configuration AP ACTIVE.");
+        Serial.print("Network name: ");
+        Serial.println(AP_SSID);
+        Serial.print("Configuration address: http://");
+        Serial.println(WiFi.softAPIP());
+    }
+
+    if (restartWindow)
+    {
+        apWindowStarted = millis();
+        apWindowExpires = apWindowStarted + AP_WINDOW_MS;
+        Serial.println("STATUS: AP one-minute window started/restarted.");
+    }
+}
+
+void stopAP()
+{
+    if (!apActive) return;
+
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    apActive = false;
+    apWindowStarted = 0;
+    apWindowExpires = 0;
+
+    // Keep station mode enabled so saved-router retry can continue.
+    WiFi.mode(WIFI_STA);
+    Serial.println("STATUS: AP window ended; configuration AP CLOSED.");
+}
+
+// =====================================================
+// 9. WIFI CONNECTION (START + RESULT)
+// =====================================================
+
+void startWiFiConnection(const String& ssid, const String& password, bool initiatedByUser)
+{
+    Serial.println();
+    Serial.println("================================");
+    Serial.println(initiatedByUser ? "STATUS: Trying NEW Wi-Fi credentials."
+                                   : "STATUS: Checking SAVED Wi-Fi network.");
+    Serial.print("Target network: ");
+    Serial.println(ssid);
+    Serial.println("================================");
+
+    pendingSSID = ssid;
+    pendingPassword = password;
+    userAttempt = initiatedByUser;
+    if (initiatedByUser) userAttemptFailed = false;
+    wasConnected = false;
+    lostSince = 0;
+
+    // Preserve the configuration AP if it is running; otherwise use station
+    // mode only. This avoids accidentally enabling AP+STA without an AP.
+    WiFi.mode(apActive ? WIFI_AP_STA : WIFI_STA);
+    WiFi.setAutoReconnect(false);
+    WiFi.persistent(false); // Preferences/NVS below is the source of truth.
+
+    // Switching to a candidate router can disconnect the old station link.
+    // The previous credentials remain saved and are restored if this fails.
+    WiFi.disconnect(false, false);
+    delay(250);
+
+    wifiAttemptStart = millis();
+    wifiAttemptInProgress = true;
+    retryPhase = RP_IDLE;
+    WiFi.begin(pendingSSID.c_str(), pendingPassword.c_str());
+}
+
+void checkWiFiConnection()
+{
+    if (!wifiAttemptInProgress) return;
+
+    // Only accept a connection to the network currently being tested.
+    if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == pendingSSID)
+    {
+        wifiAttemptInProgress = false;
+        retryPhase = RP_IDLE;
+        emptySavedSearchActive = false;
+        wasConnected = true;
+        lostSince = 0;
+
+        Serial.println();
+        Serial.println("STATUS: Router connection successful.");
+        Serial.print("Connected network: ");
+        Serial.println(WiFi.SSID());
+        Serial.print("Device IP address: ");
+        Serial.println(WiFi.localIP());
+        Serial.print("Signal strength: ");
+        Serial.print(WiFi.RSSI());
+        Serial.println(" dBm");
+
+        if (userAttempt)
+        {
+            // Save only after the candidate network has actually connected.
+            // The function verifies the values by reading them back from flash.
+            if (saveWiFiCredentials(pendingSSID, pendingPassword))
+            {
+                userAttemptFailed = false;
+                restoringPreviousNetwork = false;
+                retryPhase = RP_IDLE;
+                emptySavedSearchActive = false;
+                Serial.println("STATUS: New network saved; previous credentials replaced.");
+            }
+            else
+            {
+                Serial.println("ERROR: Wi-Fi is connected, but flash save failed. Do not power off until this is fixed.");
+            }
+        }
+        else if (restoringPreviousNetwork)
+        {
+            // The candidate failed; the old network is back online.
+            restoringPreviousNetwork = false;
+            userAttemptFailed = false;
+            Serial.println("STATUS: Saved network restored; LED returns to GREEN.");
+        }
+        else
+        {
+            Serial.println("STATUS: Saved network is available.");
+        }
+
+        userAttempt = false;
+        needSync = true;
+        lastSyncTry = 0;
+        return;
+    }
+
+    unsigned long timeout = userAttempt ? USER_WIFI_TIMEOUT_MS : SAVED_WIFI_CHECK_MS;
+    if (millis() - wifiAttemptStart < timeout) return;
+
+    bool wasUserCandidate = userAttempt;
+    wifiAttemptInProgress = false;
+    WiFi.disconnect(false, false);
+
+    Serial.println();
+    if (wasUserCandidate)
+    {
+        userAttemptFailed = true;
+        restoringPreviousNetwork = (savedSSID.length() > 0);
+        Serial.println("STATUS: NEW Wi-Fi credentials FAILED (RED LED).");
+        Serial.println("ACTION: Previous saved credentials are unchanged; restoring previous network.");
+
+        // Restore the previous working network immediately, without saving the
+        // rejected candidate. Keep userAttemptFailed true so the LED can show red
+        // while the phone remains connected to the configuration AP.
+        userAttempt = false;
+        if (savedSSID.length() > 0)
+        {
+            startWiFiConnection(savedSSID, savedPassword, false);
+        }
+        else
+        {
+            retryPhase = RP_IDLE;
+            Serial.println("INFO: No previous network was saved; AP remains active.");
+        }
+    }
+    else
+    {
+        Serial.println("STATUS: Saved network check failed.");
+        if (!apActive)
+        {
+            startAP(true);
+        }
+
+        if (savedSSID.length() > 0)
+        {
+            retryPhase = RP_WAITING;
+            retryPhaseStart = millis();
+            Serial.println("STATUS: Next saved-network retry scheduled in 4 min 30 sec.");
+        }
+        else
+        {
+            retryPhase = RP_IDLE;
+        }
+    }
+}
+
+// =====================================================
+// 10. 5-MINUTE RETRY CYCLE + WIFI LOSS DETECTION
+// =====================================================
+
+void handleRetryCycle()
+{
+    if (retryPhase != RP_WAITING) return;
+
+    // Cancel the retry timer only if the ESP32 is connected to the network
+    // that is actually saved. A connection to some other SSID must not prevent
+    // the saved network from being tested.
+    if (wifiAttemptInProgress)
+    {
+        return;
+    }
+
+    if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == savedSSID)
+    {
+        retryPhase = RP_IDLE;
+        return;
+    }
+
+    if (millis() - retryPhaseStart < RETRY_WAIT_MS) return;
+
+    // After the 4m30 wait, test the saved network for up to 30 seconds.
+    if (savedSSID.length() == 0)
+    {
+        // No real SSID exists to connect to. Start another visible 30-second
+        // search-status window, then the normal 4m30s waiting period.
+        retryPhase = RP_IDLE;
+        emptySavedSearchActive = true;
+        emptySavedSearchStart = millis();
+        return;
+    }
+
+    retryPhase = RP_CHECKING;
+    startWiFiConnection(savedSSID, savedPassword, false);
+}
+
+void handleEmptySavedSearchCycle()
+{
+    if (savedSSID.length() > 0)
+    {
+        emptySavedSearchActive = false;
+        return;
+    }
+
+    if (!emptySavedSearchActive) return;
+
+    if (millis() - emptySavedSearchStart >= SAVED_WIFI_CHECK_MS)
+    {
+        emptySavedSearchActive = false;
+        retryPhase = RP_WAITING;
+        retryPhaseStart = millis();
+    }
+}
+
+void handleWiFiLoss()
+{
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        wasConnected = true;
+        lostSince = 0;
+        return;
+    }
+
+    if (!wasConnected || wifiAttemptInProgress) return;
+
+    if (lostSince == 0)
+    {
+        lostSince = millis();
+    }
+    else if (millis() - lostSince >= WIFI_LOST_MS)
+    {
+        Serial.println("STATUS: Router Wi-Fi lost; configuration AP remains active.");
+        wasConnected = false;
+        lostSince = 0;
+
+        if (savedSSID.length() > 0)
+        {
+            retryPhase = RP_WAITING;
+            retryPhaseStart = millis() - RETRY_WAIT_MS; // retry immediately once
+        }
+    }
+}
+
+// =====================================================
+// 11. BUTTON: HOLD 10 s -> AP MODE
+// =====================================================
+
+void forceAPMode()
+{
+    // Keep button countdown/status output on the same live status row.
+    userAttemptFailed = false;
+    startAP(true); // start AP if closed, or restart its one-minute window
+}
+
+void handleButton()
+{
+    // Most ESP32 DevKit BOOT buttons are active LOW on GPIO0.
+    const bool pressed = (digitalRead(BUTTON_PIN) == LOW);
+    const unsigned long now = millis();
+
+    if (pressed)
+    {
+        if (!btnDown)
+        {
+            btnDown = true;
+            btnHandled = false;
+            btnStart = now;
+        }
+        else if (!btnHandled && (now - btnStart >= BUTTON_HOLD_MS))
+        {
+            btnHandled = true;
+            forceAPMode();
+        }
+    }
+    else
+    {
+        btnDown = false;
+        btnHandled = false;
+    }
+}
+
+void handleAPHousekeeping()
+{
+    if (!apActive || apWindowExpires == 0) return;
+    if ((long)(millis() - apWindowExpires) < 0) return;
+
+    // The AP window is strictly 60 seconds, even if a phone is connected.
+    // A new 10-second button hold opens a fresh 60-second window.
+    stopAP();
+}
+
+// =====================================================
+// 13. TIME SYNC WITHOUT NTP (HTTP Date header)
+// =====================================================
+
+bool fetchHttpDate(const char* host)
+{
+    WiFiClient client;
+    client.setTimeout(4);
+
+    if (!client.connect(host, 80, 4000)) return false;
+
+    client.print(String("HEAD / HTTP/1.1\r\nHost: ") + host +
+                 "\r\nUser-Agent: ESP32\r\nConnection: close\r\n\r\n");
+
+    unsigned long start = millis();
+    String dateLine = "";
+
+    while ((client.connected() || client.available()) && millis() - start < 5000)
+    {
+        if (!client.available())
+        {
+            delay(5);
+            continue;
+        }
+
+        String line = client.readStringUntil('\n');
+        line.trim();
+
+        if (line.length() == 0) break;      // end of headers
+
+        String low = line;
+        low.toLowerCase();
+        if (low.startsWith("date:"))
+        {
+            dateLine = line;
+            break;
+        }
+    }
+
+    client.stop();
+
+    if (dateLine.length() == 0) return false;
+
+    // Example: "Date: Wed, 28 Oct 2026 12:16:00 GMT"
+    int d, y, h, m, s;
+    char mon[4] = {0};
+
+    if (sscanf(dateLine.c_str(), "%*[^,], %d %3s %d %d:%d:%d",
+               &d, mon, &y, &h, &m, &s) != 6) return false;
+
+    const char* months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    const char* p = strstr(months, mon);
+    if (!p) return false;
+    int monIdx = (p - months) / 3;
+
+    if (y < 2024) return false;
+
+    struct tm t = {};
+    t.tm_year = y - 1900;
+    t.tm_mon  = monIdx;
+    t.tm_mday = d;
+    t.tm_hour = h;
+    t.tm_min  = m;
+    t.tm_sec  = s;
+    t.tm_isdst = 0;
+
+    // Convert UTC broken-down time to epoch.
+    setenv("TZ", "UTC0", 1);
+    tzset();
+    time_t epoch = mktime(&t);
+
+    // Back to local time zone.
+    setenv("TZ", TZ_INFO, 1);
+    tzset();
+
+    struct timeval tv;
+    tv.tv_sec = epoch;
+    tv.tv_usec = 0;
+    settimeofday(&tv, NULL);
+
+    return true;
+}
+
+String getTimeString()
+{
+    if (!timeSynced) return "Not synced";
+
+    time_t now = time(nullptr);
+    struct tm ti;
+    localtime_r(&now, &ti);
+
+    char buf[32];
+    strftime(buf, sizeof(buf), "%d-%b-%Y %H:%M:%S", &ti);
+    return String(buf);
+}
+
+void syncTimeHTTP()
+{
+    const char* hosts[] = { "www.google.com", "www.cloudflare.com", "www.microsoft.com" };
+
+    lastSyncTry = millis();
+
+    for (int i = 0; i < 3; i++)
+    {
+        if (fetchHttpDate(hosts[i]))
+        {
+            timeSynced = true;
+            lastSyncOk = millis();
+            needSync = false;
+
+            Serial.print("STATUS: Time synced via HTTP (");
+            Serial.print(hosts[i]);
+            Serial.print("): ");
+            Serial.println(getTimeString());
+            return;
+        }
+    }
+
+    // HTTP Date-header sync did not work. Try standard NTP as a fallback.
+    // This also handles routers that provide Wi-Fi but restore internet later.
+    Serial.println("STATUS: HTTP time sync failed; trying NTP fallback...");
+    configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+
+    const unsigned long ntpStart = millis();
+    while (millis() - ntpStart < 8000UL)
+    {
+        time_t now = time(nullptr);
+        if (now > 1735689600) // 2025-01-01; reject an unset system clock
+        {
+            timeSynced = true;
+            lastSyncOk = millis();
+            needSync = false;
+            Serial.print("STATUS: Time synced via NTP: ");
+            Serial.println(getTimeString());
+            return;
+        }
+        delay(200);
+        yield();
+    }
+
+    // Keep needSync true. handleTimeSync() will try again after TIME_RETRY_MS.
+    timeSynced = false;
+    needSync = true;
+    Serial.println("STATUS: Internet/time sync not ready; will retry automatically.");
+}
+
+void handleTimeSync()
+{
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    bool due = !timeSynced || needSync || (millis() - lastSyncOk >= TIME_RESYNC_MS);
+    if (!due) return;
+
+    if (lastSyncTry != 0 && millis() - lastSyncTry < TIME_RETRY_MS) return;
+
+    syncTimeHTTP();
+}
+
+// =====================================================
+// 14. WEB PAGES
+// =====================================================
+
+const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>ESP32 Wi-Fi Configuration</title>
+<style>
+body{font-family:Arial;background:#eee;text-align:center;padding:20px;}
+.box{max-width:400px;margin:auto;background:white;padding:24px;border-radius:15px;box-shadow:0 0 10px #bbb;}
+input{width:100%;padding:12px;margin:8px 0;font-size:16px;box-sizing:border-box;}
+button{padding:12px 24px;background:#007bff;color:white;border:0;border-radius:8px;font-size:16px;cursor:pointer;}
+.password-wrap{position:relative;width:100%;}
+.password-wrap input{padding-right:48px;}
+.eye{position:absolute;right:3px;top:13px;width:44px;padding:7px 0;background:transparent;color:#333;border:none;}
+.eye svg{width:23px;height:23px;vertical-align:middle;}
+.status{background:#eee;border-radius:10px;padding:12px;margin:15px 0;}
+small{color:#666;}
+</style></head><body>
+<div class='box'>
+<h2>ESP32 Wi-Fi Configuration</h2>
+<div class='status' id='connectionStatus'><h3>Loading...</h3></div>
+<form action='/save' method='POST'>
+<input type='text' name='ssid' placeholder='Enter Wi-Fi name' required>
+<div class='password-wrap'>
+<input type='password' id='wifiPassword' name='password' placeholder='Enter Wi-Fi password'>
+<button class='eye' type='button' id='eyeButton' onclick='togglePassword()' aria-label='Show password'>
+<svg id='eyeIcon' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+<path d='M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z'/><circle cx='12' cy='12' r='3'/>
+</svg></button></div>
+<br><br><button type='submit'>CONNECT</button>
+</form>
+<p><small>To open this page again: hold the device button for 10 seconds.</small></p>
+<script>
+function togglePassword(){
+ var p=document.getElementById('wifiPassword');
+ var b=document.getElementById('eyeButton');
+ var i=document.getElementById('eyeIcon');
+ if(p.type==='password'){
+  p.type='text';
+  b.setAttribute('aria-label','Hide password');
+  i.innerHTML='<path d="M3 3l18 18"/><path d="M6.6 6.6C3.7 8.2 2 12 2 12s3.5 7 10 7"/><path d="M14.1 14.1A3 3 0 0 1 9.9 9.9"/><path d="M17.4 17.4C20.3 15.8 22 12 22 12s-1.2-2.4-3.4-4.3"/>';
+ }else{
+  p.type='password';
+  b.setAttribute('aria-label','Show password');
+  i.innerHTML='<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/>';
+ }
+}
+async function refresh(){
+ try{
+  const r=await fetch('/status',{cache:'no-store'});
+  const d=await r.json();
+  const s=document.getElementById('connectionStatus');
+  if(d.state==='connected'){
+   s.innerHTML='<h3 style="color:green">Wi-Fi Connected</h3><p>Network: '+d.ssid+'</p><p>Router IP: '+d.ip+'</p><p>Time: '+d.time+'</p>';
+  }else if(d.state==='failed'){
+   s.innerHTML='<h3 style="color:red">Connection Failed</h3><p>Check the Wi-Fi name and password.</p>';
+  }else if(d.state==='connecting'){
+   s.innerHTML='<h3>Connecting to Wi-Fi...</h3><p>Please wait.</p>';
+  }else{
+   s.innerHTML='<h3>ESP32 Ready</h3><p>Enter your router Wi-Fi details.</p>';
+  }
+ }catch(e){}
+}
+refresh();
+setInterval(refresh,1000);
+</script>
+</div></body></html>
+)rawliteral";
+
+const char RESULT_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Wi-Fi Connection Status</title></head>
+<body style='font-family:Arial;text-align:center;padding:25px;'>
+<h2>Wi-Fi Connection Status</h2>
+<p id='result'>Checking network credentials...</p>
+<p><a href='/'>Back to configuration</a></p>
+<script>
+async function check(){
+ try{
+  const r=await fetch('/status',{cache:'no-store'});
+  const d=await r.json();
+  const e=document.getElementById('result');
+  if(d.state==='connected'){
+   e.innerHTML='<h3 style="color:green">Connection Successful</h3><p>Network: '+d.ssid+'</p><p>Device IP: '+d.ip+'</p>';
+  }else if(d.state==='failed'){
+   e.innerHTML='<h3 style="color:red">Connection Failed</h3><p>Verify the network name and password.</p>';
+  }else{
+   e.innerText='Checking network connection...';
+   setTimeout(check,1000);
+  }
+ }catch(err){setTimeout(check,1000);}
+}
+setTimeout(check,500);
+</script></body></html>
+)rawliteral";
+
+String jsonEscape(const String& in)
+{
+    String out = "";
+    for (unsigned int i = 0; i < in.length(); i++)
+    {
+        char c = in[i];
+        if (c == '"' || c == '\\') out += '\\';
+        out += c;
+    }
+    return out;
+}
+
+void handleRoot()
+{
+    server.sendHeader("Cache-Control", "no-store");
+    server.send_P(200, "text/html", CONFIG_PAGE);
+}
+
+void handleSave()
+{
+    String newSSID = server.arg("ssid");
+    String newPassword = server.arg("password");
+
+    newSSID.trim();
+
+    if (newSSID.length() == 0)
+    {
+        server.send(400, "text/plain", "Wi-Fi name is required.");
+        return;
+    }
+
+    Serial.println();
+    Serial.println("STATUS: New network configuration received.");
+
+    // Send the result page first, then start connecting
+    // (STA channel change may drop the phone briefly).
+    server.send_P(200, "text/html", RESULT_PAGE);
+    delay(100);
+
+    startWiFiConnection(newSSID, newPassword, true);
+}
+
+void handleStatus()
+{
+    String json = "{";
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        json += "\"state\":\"connected\",";
+        json += "\"ssid\":\"" + jsonEscape(WiFi.SSID()) + "\",";
+        json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+        json += "\"time\":\"" + getTimeString() + "\"";
+    }
+    else if (wifiAttemptInProgress && userAttempt)
+    {
+        json += "\"state\":\"connecting\"";
+    }
+    else if (userAttemptFailed)
+    {
+        json += "\"state\":\"failed\"";
+    }
+    else
+    {
+        json += "\"state\":\"idle\"";
+    }
+
+    json += "}";
+
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", json);
+}
+
+// Captive portal: every probe / unknown URL goes to the config page.
+void handleRedirect()
+{
+    String target = "http://" +
+        (apActive ? apIP.toString() : WiFi.localIP().toString()) + "/";
+
+    server.sendHeader("Location", target, true);
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(302, "text/plain", "");
+}
+
+// =====================================================
+// 15. SETUP
+// =====================================================
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(300);
+
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("DEVICE INITIALIZATION STARTED");
+    Serial.println("================================");
+
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    Serial.print("BUTTON TEST: Button initial level = ");
+    Serial.println(digitalRead(BUTTON_PIN) == LOW ? " ON " : " OFF ");
+    Serial.println("BUTTON TEST: Press BOOT; live status should show Button  = ON ");
+
+    Serial.println("INIT: Initializing WS2812 LEDs...");
+    FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+    FastLED.setBrightness(LED_BRIGHTNESS); 
+    setLEDStatus(LED_AP_MODE);          // violet at start
+    Serial.println("INIT: WS2812 initialization complete.");
+
+    setenv("TZ", TZ_INFO, 1);
+    tzset();
+
+    loadWiFiCredentials();
+
+    // Web server routes.
+    Serial.println("INIT: Registering web server routes...");
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/save", HTTP_POST, handleSave);
+    server.on("/status", HTTP_GET, handleStatus);
+
+    // Android / Apple / Windows captive-portal probes.
+    server.on("/generate_204", HTTP_ANY, handleRedirect);
+    server.on("/gen_204", HTTP_ANY, handleRedirect);
+    server.on("/hotspot-detect.html", HTTP_ANY, handleRedirect);
+    server.on("/library/test/success.html", HTTP_ANY, handleRedirect);
+    server.on("/success.txt", HTTP_ANY, handleRedirect);
+    server.on("/connecttest.txt", HTTP_ANY, handleRedirect);
+    server.on("/ncsi.txt", HTTP_ANY, handleRedirect);
+    server.on("/redirect", HTTP_ANY, handleRedirect);
+    server.on("/canonical.html", HTTP_ANY, handleRedirect);
+    server.on("/fwlink", HTTP_ANY, handleRedirect);
+    server.onNotFound(handleRedirect);
+
+    // Initialize Wi-Fi before starting the web server.
+    // Wi-Fi sleep is left at its default; disabling it is not required here.
+    Serial.println("INIT: Starting Wi-Fi driver in station mode...");
+    WiFi.mode(WIFI_STA);
+    delay(100);
+
+    Serial.println("INIT: Starting web server...");
+    server.begin();
+
+    // Start the configuration AP immediately on every boot. The station
+    // connection attempt runs alongside it in AP+STA mode.
+    Serial.println("INIT: Starting configuration AP for the initial 60-second window...");
+    startAP(true);
+
+    if (savedSSID.length() > 0)
+    {
+        // Credentials were loaded from NVS flash above. Try this saved router
+        // automatically at every boot while the configuration AP is available.
+        Serial.print("BOOT: Auto-connecting to saved SSID: ");
+        Serial.println(savedSSID);
+        startWiFiConnection(savedSSID, savedPassword, false);
+    }
+    else
+    {
+        // No credentials have been saved yet. Keep the configuration AP open
+        // so the user can enter Wi-Fi details; do not pretend to search for a
+        // network when there is no saved SSID to try.
+        emptySavedSearchActive = false;
+        retryPhase = RP_IDLE;
+        Serial.println("STATUS: No saved network; enter Wi-Fi details on the configuration page.");
+    }
+}
+
+// =====================================================
+// 16. CONTINUOUS DATE/TIME IN SERIAL MONITOR
+// =====================================================
+
+void printDateTimePeriodically()
+{
+    const unsigned long nowMs = millis();
+    if (nowMs - lastSerialTimePrint < SERIAL_TIME_INTERVAL_MS) return;
+    lastSerialTimePrint = nowMs;
+
+    // Build the complete status in one string and overwrite the same terminal row.
+    String line;
+    line.reserve(320);
+
+    line += "[";
+    line += (timeSynced ? getTimeString() : String("DATE/TIME NOT SYNCED"));
+    line += "] | ";
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        line += "Router = ";
+        line += WiFi.SSID();
+
+    }
+    else
+    {
+        line += "Router = DISCONNECTED";
+    }
+
+    line += " | AP = ";
+    line += (apActive ? "ON" : "OFF");
+
+    if (apActive && apWindowExpires != 0)
+    {
+        long remainingMs = (long)(apWindowExpires - nowMs);
+        if (remainingMs > 0)
+        {
+            const unsigned long remainingSec = (remainingMs + 999) / 1000;
+            line += " | AP left = ";
+            line += String(remainingSec);
+            line += "s";
+        }
+    }
+
+    // Always include client count so the status fields stay in a consistent order.
+    line += " | DEVICE = ";
+    line += String(apActive ? WiFi.softAPgetStationNum() : 0);
+
+    // Saved network search / retry countdown.
+    line += " | SAVED Network: ";
+
+    if (WiFi.status() == WL_CONNECTED && !userAttemptFailed)
+    {
+        line += WiFi.SSID();
+        line += " | STATUS: CONNECTED";
+    }
+    else if (wifiAttemptInProgress && !userAttempt)
+    {
+        const unsigned long elapsed = nowMs - wifiAttemptStart;
+        const unsigned long remainingMs = (elapsed >= SAVED_WIFI_CHECK_MS)
+                                            ? 0
+                                            : (SAVED_WIFI_CHECK_MS - elapsed);
+        const unsigned long remainingSec = (remainingMs + 999) / 1000;
+
+        line += (savedSSID.length() > 0 ? savedSSID : String("NOTHING"));
+        line += " | SEARCH: ";
+        line += String(remainingSec);
+        line += " sec";
+    }
+    else if (retryPhase == RP_WAITING)
+    {
+        const unsigned long elapsed = nowMs - retryPhaseStart;
+        const unsigned long remainingMs = (elapsed >= RETRY_WAIT_MS)
+                                            ? 0
+                                            : (RETRY_WAIT_MS - elapsed);
+        const unsigned long remainingSec = (remainingMs + 999) / 1000;
+        const unsigned long minutesLeft = remainingSec / 60;
+        const unsigned long secondsLeft = remainingSec % 60;
+
+        line += "NOT FOUND | SEARCH AFTER: ";
+        line += String(minutesLeft);
+        line += "m ";
+        if (secondsLeft < 10) line += "0";
+        line += String(secondsLeft);
+        line += " sec";
+    }
+    else if (savedSSID.length() == 0)
+    {
+        // Initial state: no credentials have ever been saved, so there is no
+        // saved network to search for. The user must configure one via the AP.
+        line += "NOT FOUND | STATUS: NO SAVED CREDENTIALS";
+    }
+    else if (emptySavedSearchActive)
+    {
+        // Defensive fallback; this normally stays false when there is no SSID.
+        line += "NOT FOUND | STATUS: NO SAVED CREDENTIALS";
+    }
+    else
+    {
+        line += "NOT FOUND | STATUS: WAITING FOR NEXT SEARCH";
+    }
+
+    // Button state and countdown are included on the same live row.
+   // Button state and countdown are included on the same live row.
+line += " | Button = ";
+line += (digitalRead(BUTTON_PIN) == LOW ? "ON" : "OFF");
+
+    if (btnDown && !btnHandled)
+    {
+        const unsigned long elapsed = nowMs - btnStart;
+        const unsigned long remaining = (elapsed >= BUTTON_HOLD_MS)
+                                          ? 0
+                                          : (BUTTON_HOLD_MS - elapsed + 999) / 1000;
+        line += " | Button counts =";
+        line += String(remaining);
+        line += "s";
+    }
+    else if (btnHandled)
+    {
+        line += " | Button = 10s COMPLETE";
+    }
+
+    // '\r' returns to the beginning of the same row; padding erases old leftovers.
+    Serial.write('\r');
+    Serial.print(line);
+    if (previousStatusLineLength > line.length())
+    {
+        for (size_t i = line.length(); i < previousStatusLineLength; ++i)
+        {
+            Serial.write(' ');
+        }
+    }
+    previousStatusLineLength = line.length();
+}
+
+// =====================================================
+// 17. LOOP
+// =====================================================
+
+void loop()
+{
+    if (apActive) dnsServer.processNextRequest();
+    server.handleClient();
+
+    handleButton();
+    checkWiFiConnection();
+    handleWiFiLoss();
+    handleRetryCycle();
+    handleEmptySavedSearchCycle();
+    handleAPHousekeeping();
+    handleTimeSync();
+
+    updateLEDStatus();
+    printDateTimePeriodically();
+}
