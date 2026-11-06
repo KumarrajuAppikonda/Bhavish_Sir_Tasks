@@ -1,0 +1,63 @@
+#include <Arduino.h>
+
+#define SWITCH_PIN 4
+#define LED1_PIN   27
+#define LED2_PIN   18
+
+int state = 0;
+int lastButtonState = HIGH;
+
+void setup()
+{
+    Serial.begin(115200);
+
+    pinMode(SWITCH_PIN, INPUT_PULLUP);
+
+    pinMode(LED1_PIN, OUTPUT);
+    pinMode(LED2_PIN, OUTPUT);
+
+    digitalWrite(LED1_PIN, LOW);
+    digitalWrite(LED2_PIN, LOW);
+}
+
+void loop()
+{
+    int buttonState = digitalRead(SWITCH_PIN);
+
+    // Detect button press
+    if (lastButtonState == HIGH && buttonState == LOW)
+    {
+        state++;
+
+        if (state == 1)
+        {
+            // LED 1 ON
+            digitalWrite(LED1_PIN, HIGH);
+            digitalWrite(LED2_PIN, LOW);
+
+            Serial.println("LED 1 ON");
+        }
+        else if (state == 2)
+        {
+            // LED 1 OFF, LED 2 ON
+            digitalWrite(LED1_PIN, LOW);
+            digitalWrite(LED2_PIN, HIGH);
+
+            Serial.println("LED 2 ON , LED 1 OFF");
+        }
+        else if (state == 3)
+        {
+            // Both OFF
+            digitalWrite(LED1_PIN, LOW);
+            digitalWrite(LED2_PIN, LOW);
+
+            Serial.println("Both LEDs OFF");
+
+            state = 0;
+        }
+
+        delay(200);
+    }
+
+    lastButtonState = buttonState;
+}

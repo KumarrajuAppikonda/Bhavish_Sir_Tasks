@@ -1,0 +1,100 @@
+#include <Arduino.h>
+#include <FastLED.h>
+
+#define SWITCH_PIN 4
+#define WS2812_PIN 5
+#define NUM_LEDS   8
+
+CRGB leds[NUM_LEDS];
+
+int state = 0;
+int lastButtonState = HIGH;
+
+void setup()
+{
+    Serial.begin(115200);
+
+    // Switch
+    pinMode(SWITCH_PIN, INPUT_PULLUP);
+
+    // WS2812
+    FastLED.addLeds<WS2812B, WS2812_PIN, GRB>(leds, NUM_LEDS);
+
+    FastLED.setBrightness(80);
+
+    // Start with all LEDs OFF
+    fill_solid(leds, NUM_LEDS, CRGB::Black);
+    FastLED.show();
+
+    Serial.println("TASK 2 - WS2812 TEST");
+}
+
+void loop()
+{
+    int buttonState = digitalRead(SWITCH_PIN);
+
+    // Detect button press
+    if (lastButtonState == HIGH && buttonState == LOW)
+    {
+        state++;
+
+        // Press 1 - RED
+        if (state == 1)
+        {
+            fill_solid(leds, NUM_LEDS, CRGB::Red);
+            Serial.println("RED");
+        }
+
+        // Press 2 - GREEN
+        else if (state == 2)
+        {
+            fill_solid(leds, NUM_LEDS, CRGB::Green);
+            Serial.println("GREEN");
+        }
+
+        // Press 3 - BLUE
+        else if (state == 3)
+        {
+            fill_solid(leds, NUM_LEDS, CRGB::Blue);
+            Serial.println("BLUE");
+        }
+
+        // Press 4 - YELLOW
+        else if (state == 4)
+        {
+            fill_solid(leds, NUM_LEDS, CRGB::Yellow);
+            Serial.println("YELLOW");
+        }
+
+        // Press 5 - PURPLE
+        else if (state == 5)
+        {
+            fill_solid(leds, NUM_LEDS, CRGB::Purple);
+            Serial.println("PURPLE");
+        }
+
+        // Press 6 - CYAN
+        else if (state == 6)
+        {
+            fill_solid(leds, NUM_LEDS, CRGB::Cyan);
+            Serial.println("CYAN");
+        }
+
+        // Press 7 - OFF
+        else if (state == 7)
+        {
+            fill_solid(leds, NUM_LEDS, CRGB::Black);
+            Serial.println("ALL LEDs OFF");
+
+            state = 0;
+        }
+
+        // Send color to LEDs
+        FastLED.show();
+
+        // Button debounce
+        delay(200);
+    }
+
+    lastButtonState = buttonState;
+}
